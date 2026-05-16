@@ -1,0 +1,7 @@
+node_modules/
+.playwright-chrome/
+.zentao-session.json
+*.png
+debug-*
+final-*
+verify-*

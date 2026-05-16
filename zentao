@@ -1,0 +1,2 @@
+#!/bin/bash
+node "D:/zentao-screenshots/zentao-shot.js" "$@"
