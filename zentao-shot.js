@@ -376,8 +376,13 @@ async function screenshotDoc(page, projectName, docName) {
 
 (async () => {
   const args = process.argv.slice(2);
+  const chromePath = path.join(
+    process.env.USERPROFILE || process.env.HOME,
+    'AppData', 'Local', 'ms-playwright', 'chromium-1223', 'chrome-win64', 'chrome.exe'
+  );
   const browser = await chromium.launch({
     headless: true,
+    executablePath: fs.existsSync(chromePath) ? chromePath : undefined,
     args: ['--disable-gpu', '--disable-dev-shm-usage', '--no-sandbox', '--disable-extensions', '--disable-background-networking'],
   });
   const context = await browser.newContext({
