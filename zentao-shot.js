@@ -56,6 +56,32 @@ function ask(q) {
 }
 function getFrame(page) { return page.frame({ name: 'app-doc' }) || page; }
 
+// 翻页：点击"下一页"，返回是否成功
+async function clickNextPage(page) {
+  const f = getFrame(page);
+  // 禅道新版用 nav.pager > button.pager-link > i.icon-angle-right
+  // 旧版兼容文字链接
+  const selectors = [
+    'nav.pager button.pager-link:not(.disabled):has(.icon-angle-right)',
+    '.pager button.pager-link:not(.disabled):has(.icon-angle-right)',
+    'button.pager-link:not(.disabled):has(.icon-angle-right)',
+    'nav.pager button:not(.disabled):has(.icon-angle-right)',
+    'a:has-text("下一页")',
+    '.pager .next:not(.disabled)',
+  ];
+  for (const sel of selectors) {
+    try {
+      const btn = f.locator(sel).first();
+      if (await btn.count() > 0 && await btn.isVisible({ timeout: 1000 }).catch(() => false)) {
+        await btn.click({ timeout: 3000 });
+        await page.waitForTimeout(800);
+        return true;
+      }
+    } catch {}
+  }
+  return false;
+}
+
 // 像素裁剪：从底部向上扫正文区域（跳过左侧大纲面板），找内容结束行
 function trimBottom(pngBuf, padBottom) {
   const png = PNG.sync.read(pngBuf);
@@ -84,8 +110,10 @@ async function ensureLogin(page) {
   if (page.url().includes('user-login')) {
     await page.locator('input[name="account"]').fill(CONFIG.username);
     await page.locator('input[name="password"]').fill(CONFIG.password);
-    await page.locator('#submit, button[type="submit"], input[type="submit"], .btn-primary').first().click();
-    await page.waitForURL(/\/my/, { timeout: W.TIMEOUT });
+    await Promise.all([
+      page.waitForURL(/\/my/, { timeout: W.TIMEOUT }),
+      page.locator('#submit, button[type="submit"], input[type="submit"], .btn-primary').first().click(),
+    ]);
     fs.writeFileSync(CONFIG.stateFile, JSON.stringify(await page.context().storageState()));
   }
 }
@@ -132,14 +160,29 @@ async function getProjects(page) {
     await page.waitForTimeout(W.TAB);
     projects = await getFrame(page).evaluate(_filterProjects);
   }
-  return projects;
+  // 翻页获取全部项目
+  const all = new Set(projects);
+  for (let pg = 1; pg < 20; pg++) {
+    const hasNext = await getFrame(page).evaluate(() => {
+      const nav = document.querySelector('nav.pager, .pager');
+      if (!nav) return false;
+      const nextBtn = nav.querySelector('button.pager-link:not(.disabled) .icon-angle-right, button:not(.disabled) .icon-angle-right');
+      return !!(nextBtn && nextBtn.offsetParent !== null);
+    });
+    if (!hasNext) break;
+    if (!(await clickNextPage(page))) break;
+    await getFrame(page).evaluate(_filterProjects).then(more => more.forEach(p => all.add(p)));
+  }
+  return [...all];
 }
 async function getDocsForProject(page, projectName) {
   await ensureProjectSpace(page);
   const f = getFrame(page);
   await f.locator('text=' + projectName).first().click();
   await page.waitForTimeout(W.PAGE);
-  return await getFrame(page).evaluate(exName => {
+
+  // 文档收集函数（与之前相同，提取为复用）
+  const collectDocs = (exName) => {
     const exclude = new Set([
       '文档', '仪表盘', '快捷访问', '我的空间', '团队空间', '产品空间', '项目空间',
       'ID', '文档标题', '收藏', '浏览次数', '由谁添加', '创建日期', '修改者', '修改日期', '操作',
@@ -156,31 +199,97 @@ async function getDocsForProject(page, projectName) {
       }
     }
     return out;
-  }, projectName);
+  };
+
+  // 首页
+  let docs = await getFrame(page).evaluate(collectDocs, projectName);
+  const all = new Set(docs);
+  console.log('  [分页] 第1页: ' + docs.length + ' 个文档');
+
+  // 翻页获取全部文档
+  const MAX_PAGES = 50;
+  for (let pg = 2; pg <= MAX_PAGES; pg++) {
+    const hasNext = await getFrame(page).evaluate(() => {
+      const nav = document.querySelector('nav.pager, .pager');
+      if (!nav) return false;
+      const nextBtn = nav.querySelector('button.pager-link:not(.disabled) .icon-angle-right, button:not(.disabled) .icon-angle-right');
+      return !!(nextBtn && nextBtn.offsetParent !== null);
+    });
+    if (!hasNext) break;
+    if (!(await clickNextPage(page))) break;
+    await page.waitForTimeout(500);
+    const more = await getFrame(page).evaluate(collectDocs, projectName);
+    if (more.length === 0) break;
+    more.forEach(d => all.add(d));
+    console.log('  [分页] 第' + pg + '页: +' + more.length + ' 个 (累计 ' + all.size + ' 个)');
+  }
+  return [...all];
 }
 
 // ============================================================
 // 文档截图辅助
 // ============================================================
 async function clickDoc(page, projectName, docName) {
-  const f = getFrame(page); let ok = false;
-  try { await f.locator('.cursor-pointer:has([title="' + docName + '"])').first().click({ timeout: W.CLICK }); ok = true; }
-  catch (e) { console.log('  [warn] click: ' + e.message.slice(0, 50)); }
-  if (!ok) {
-    try { await f.locator('a:has-text("' + docName + '")').first().click({ timeout: W.CLICK_ALT }); ok = true; }
-    catch (e) { console.log('  [warn] click: ' + e.message.slice(0, 50)); }
+  // 辅助：在当前页尝试点击文档链接
+  async function tryClick() {
+    const f = getFrame(page);
+    try { await f.locator('.cursor-pointer:has([title="' + docName + '"])').first().click({ timeout: W.CLICK }); return true; }
+    catch (e) {}
+    try { await f.locator('a:has-text("' + docName + '")').first().click({ timeout: W.CLICK_ALT }); return true; }
+    catch (e) {}
+    return false;
   }
-  if (!ok) {
-    console.log('  回退: 重新导航...');
-    await ensureProjectSpace(page);
-    const t = getFrame(page);
-    await t.locator('text=' + projectName).first().click();
-    await page.waitForTimeout(W.TAB);
-    const tf = getFrame(page);
-    try { await tf.locator('.cursor-pointer:has([title="' + docName + '"])').first().click({ timeout: W.FALLBACK }); }
-    catch { await tf.locator('a:has-text("' + docName + '")').first().click(); }
+
+  if (await tryClick()) {
+    await getFrame(page).locator('#main').waitFor({ state: 'visible', timeout: W.TIMEOUT });
+    return;
   }
-  await getFrame(page).locator('#main').waitFor({ state: 'visible', timeout: W.TIMEOUT });
+
+  // 当前页没找到，翻页查找（最多 50 页）
+  for (let pg = 1; pg < 50; pg++) {
+    const hasNext = await getFrame(page).evaluate(() => {
+      const nav = document.querySelector('nav.pager, .pager');
+      if (!nav) return false;
+      const nextBtn = nav.querySelector('button.pager-link:not(.disabled) .icon-angle-right, button:not(.disabled) .icon-angle-right');
+      return !!(nextBtn && nextBtn.offsetParent !== null);
+    });
+    if (!hasNext) break;
+    if (!(await clickNextPage(page))) break;
+    await page.waitForTimeout(500);
+    if (await tryClick()) {
+      await getFrame(page).locator('#main').waitFor({ state: 'visible', timeout: W.TIMEOUT });
+      return;
+    }
+  }
+
+  // 仍没找到，重新导航后翻页再试
+  console.log('  回退: 重新导航...');
+  await ensureProjectSpace(page);
+  const t = getFrame(page);
+  await t.locator('text=' + projectName).first().click();
+  await page.waitForTimeout(W.TAB);
+
+  if (await tryClick()) {
+    await getFrame(page).locator('#main').waitFor({ state: 'visible', timeout: W.TIMEOUT });
+    return;
+  }
+  for (let pg = 1; pg < 50; pg++) {
+    const hasNext = await getFrame(page).evaluate(() => {
+      const nav = document.querySelector('nav.pager, .pager');
+      if (!nav) return false;
+      const nextBtn = nav.querySelector('button.pager-link:not(.disabled) .icon-angle-right, button:not(.disabled) .icon-angle-right');
+      return !!(nextBtn && nextBtn.offsetParent !== null);
+    });
+    if (!hasNext) break;
+    if (!(await clickNextPage(page))) break;
+    await page.waitForTimeout(500);
+    if (await tryClick()) {
+      await getFrame(page).locator('#main').waitFor({ state: 'visible', timeout: W.TIMEOUT });
+      return;
+    }
+  }
+
+  throw new Error('找不到文档: ' + docName);
 }
 async function waitForDocStable(page) {
   await page.waitForLoadState('networkidle', { timeout: W.NETIDLE }).catch(() => {});
@@ -221,14 +330,30 @@ async function skipIfAttachment(page) {
   const hasAffine = (await f.locator('.editor.doc-editor-control').count()) > 0;
   const hasOld = (await f.locator('.doc-editor').count()) > 0;
   if (hasAffine) {
-    const len = await f.evaluate(() => { const ed = document.querySelector('.editor.doc-editor-control'); return ed ? ed.innerText?.length || 0 : 0; });
-    if (len <= 60) { console.log('  跳过: 仅附件'); return true; }
+    const info = await f.evaluate(() => {
+      const ed = document.querySelector('.editor.doc-editor-control');
+      if (!ed) return { len: 0, imgCount: 0 };
+      const len = ed.innerText?.length || 0;
+      const imgCount = ed.querySelectorAll('img').length;
+      return { len, imgCount };
+    });
+    // 有图片内容时不跳过，即使文字少
+    if (info.imgCount > 0) { console.log('  检测到 ' + info.imgCount + ' 张图片，继续截图'); return false; }
+    if (info.len <= 60) { console.log('  跳过: 仅附件(无文字无图片)'); return true; }
   }
   if (!hasAffine && hasOld) {
     const hasFiles = (await f.locator('.file, .files, [class*="file-list"], [class*="attachment"], [class*="doc-files"]').count()) > 0;
     if (hasFiles) {
-      const t = await f.evaluate(() => { const ed = document.querySelector('.doc-editor'); return ed ? ed.innerText?.trim() || '' : ''; });
-      if (t.length < 150) { console.log('  跳过: 仅附件'); return true; }
+      const info = await f.evaluate(() => {
+        const ed = document.querySelector('.doc-editor');
+        if (!ed) return { len: 0, imgCount: 0 };
+        const len = ed.innerText?.trim().length || 0;
+        const imgCount = ed.querySelectorAll('img').length;
+        return { len, imgCount };
+      });
+      // 有图片内容时不跳过
+      if (info.imgCount > 0) { console.log('  检测到 ' + info.imgCount + ' 张图片，继续截图'); return false; }
+      if (info.len < 150) { console.log('  跳过: 仅附件(无文字无图片)'); return true; }
     }
   }
   return false;
