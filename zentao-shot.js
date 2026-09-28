@@ -33,16 +33,14 @@ const W = {
   SCROLL_INITIAL: 1000, SCROLL_STEP: 800, SCROLL_FINAL: 1000,
   OVERFLOW_SETTLE: 800, OVERFLOW_OLD: 1000, POST_EXPAND: 1500,
   VP_RESIZE: 500, VP_SETTLE: 800,
-  CLICK: 3000, CLICK_ALT: 2000, FALLBACK: 5000,
-  TIMEOUT: 10000, EDITOR_TO: 15000,
+  TIMEOUT: 10000, EDITOR_TO: 15000, EDITOR_LOAD: 30000,
 };
-const PAD_X = 10, PAD_BOTTOM = 10;
+const PAD_X = 10, PAD_BOTTOM = 10, PAD_H = 40; // PAD_H: 左右白边
+const MAX_VP_H = 16000; // 放大 viewport 的上限（Chromium 单次截图高度约 16384px）
 
 // ============================================================
 // 选择器
 // ============================================================
-const SCROLL_CONTAINER = '.doc-view-content, .doc-main, .scrollbar-hover';
-const EXPAND_ALL = SCROLL_CONTAINER + ', .doc-app-body, #mainContent, #main, .doc-editor, .doc-view, .detail-body, .detail-main, .detail-sections, .editor.doc-editor-control';
 const EXPAND_OLD = '.doc-editor, .doc-view, .detail-body, .detail-main, .detail-sections, #mainContent';
 const CONTENT_EL_AFFINE = '.editor.doc-editor-control'; // Affine 纯正文（无工具栏）
 const CONTENT_EL_OLD = '.doc-editor';                   // 旧版编辑器
@@ -82,17 +80,16 @@ async function clickNextPage(page) {
   return false;
 }
 
-// 像素裁剪：从底部向上扫正文区域（跳过左侧大纲面板），找内容结束行
+// 像素裁剪：从底部向上扫整行，找内容结束行
+// （截图对象是编辑器 / .doc-view 元素本身，不含左侧大纲面板，必须扫全宽，否则靠左的短行会被当成空白裁掉）
 function trimBottom(pngBuf, padBottom) {
   const png = PNG.sync.read(pngBuf);
   const { width, height, data } = png;
-  const L = Math.round(width * 0.2);  // 左 20% 是大纲面板，跳过
-  const R = Math.round(width * 0.95); // 右 5% 留边距
   const MIN_RANGE = 15;
   for (let y = height - 1; y >= 0; y--) {
     const off = y * width * 4;
     let minR = 255, maxR = 0;
-    for (let x = L; x < R; x += 4) {
+    for (let x = 0; x < width; x += 2) {
       const i = off + x * 4;
       if (data[i + 3] === 0) continue;
       const r = data[i]; if (r < minR) minR = r; if (r > maxR) maxR = r;
@@ -175,121 +172,99 @@ async function getProjects(page) {
   }
   return [...all];
 }
-async function getDocsForProject(page, projectName) {
-  await ensureProjectSpace(page);
-  const f = getFrame(page);
-  await f.locator('text=' + projectName).first().click();
-  await page.waitForTimeout(W.PAGE);
-
-  // 文档收集函数（与之前相同，提取为复用）
-  const collectDocs = (exName) => {
-    const exclude = new Set([
-      '文档', '仪表盘', '快捷访问', '我的空间', '团队空间', '产品空间', '项目空间',
-      'ID', '文档标题', '收藏', '浏览次数', '由谁添加', '创建日期', '修改者', '修改日期', '操作',
-      '全部', '草稿', '我收藏的', '我创建的', '我编辑的', '导入', '创建',
-      '项目主库', '附件库', '项目', '执行', exName,
-    ]);
-    const seen = new Set(), out = [];
-    for (const el of document.querySelectorAll('a')) {
-      const t = el.textContent?.trim();
-      if (t && t.length > 2 && t.length < 80 && !seen.has(t) && !exclude.has(t)
-          && !t.includes('共 ') && !t.includes('每页') && !t.match(/^\d+$/)
-          && !t.includes('阶段主库') && !t.includes('库：') && !t.includes('全部')) {
-        seen.add(t); out.push(t);
-      }
-    }
-    return out;
-  };
-
-  // 首页
-  let docs = await getFrame(page).evaluate(collectDocs, projectName);
-  const all = new Set(docs);
-  console.log('  [分页] 第1页: ' + docs.length + ' 个文档');
-
-  // 翻页获取全部文档
-  const MAX_PAGES = 50;
-  for (let pg = 2; pg <= MAX_PAGES; pg++) {
-    const hasNext = await getFrame(page).evaluate(() => {
-      const nav = document.querySelector('nav.pager, .pager');
-      if (!nav) return false;
-      const nextBtn = nav.querySelector('button.pager-link:not(.disabled) .icon-angle-right, button:not(.disabled) .icon-angle-right');
-      return !!(nextBtn && nextBtn.offsetParent !== null);
-    });
-    if (!hasNext) break;
-    if (!(await clickNextPage(page))) break;
-    await page.waitForTimeout(500);
-    const more = await getFrame(page).evaluate(collectDocs, projectName);
-    if (more.length === 0) break;
-    more.forEach(d => all.add(d));
-    console.log('  [分页] 第' + pg + '页: +' + more.length + ' 个 (累计 ' + all.size + ' 个)');
+// 文档列表当前页的行（页面 eval 用）：标题单元格的 data-row 就是文档 ID
+function _collectDocRowsEval() {
+  const out = [];
+  for (const cell of document.querySelectorAll('.dtable-cell[data-col="title"][data-row]')) {
+    const id = cell.getAttribute('data-row');
+    const a = cell.querySelector('a.doc-list-item-title');
+    if (!/^\d+$/.test(id) || !a) continue;
+    out.push({ id, title: (a.textContent || a.title || '').trim() });
   }
-  return [...all];
+  return out;
+}
+function _hasNextPageEval() {
+  const nav = document.querySelector('nav.pager, .pager');
+  if (!nav) return false;
+  const nextBtn = nav.querySelector('button.pager-link:not(.disabled) .icon-angle-right, button:not(.disabled) .icon-angle-right');
+  return !!(nextBtn && nextBtn.offsetParent !== null);
+}
+
+async function openProject(page, projectName) {
+  await ensureProjectSpace(page);
+  await getFrame(page).locator('text=' + projectName).first().click();
+  await getFrame(page).locator('.dtable-cell[data-col="title"]').first().waitFor({ timeout: W.TIMEOUT }).catch(() => {});
+  await page.waitForLoadState('networkidle', { timeout: W.NETIDLE }).catch(() => {});
+  await page.waitForTimeout(W.PAGE);
+}
+
+// 项目文档列表
+// 进入项目后的默认视图就是该项目的「全部文档」（已包含项目主库和各阶段主库，不含附件库里的文件），
+// 所以不再逐个点击子库。返回 [{ id, title, name, file }]：
+//   name  列表显示 / 输入匹配用，同名文档按列表顺序加 " (2)"、" (3)"
+//   file  截图文件名（不含扩展名），与 name 使用同样的后缀
+async function getDocsForProject(page, projectName) {
+  await openProject(page, projectName);
+  const byId = new Map();
+  for (let pg = 1; pg <= 50; pg++) {
+    const rows = await getFrame(page).evaluate(_collectDocRowsEval);
+    rows.forEach(r => { if (!byId.has(r.id)) byId.set(r.id, r); });
+    if (!(await getFrame(page).evaluate(_hasNextPageEval))) break;
+    if (!(await clickNextPage(page))) break;
+    // 等下一页渲染出来（首行 ID 变化）；翻不动就停止
+    let moved = false;
+    for (let t = 0; t < 20 && !moved; t++) {
+      const cur = await getFrame(page).evaluate(_collectDocRowsEval);
+      moved = cur.length > 0 && cur[0].id !== rows[0]?.id;
+      if (!moved) await page.waitForTimeout(250);
+    }
+    if (!moved) break;
+  }
+
+  const pagerText = await getFrame(page).evaluate(() => document.querySelector('nav.pager, .pager')?.innerText || '');
+  const total = parseInt((pagerText.match(/共\s*(\d+)\s*项/) || [])[1], 10);
+  if (total && total !== byId.size) console.log('  [warn] 列表显示共 ' + total + ' 项，实际只收集到 ' + byId.size + ' 篇');
+
+  const docs = [...byId.values()];
+  const count = {}, used = new Set();
+  for (const d of docs) {
+    const base = d.title.replace(/[\/:*?"<>|]/g, '_').slice(0, 50);
+    const key = base.toLowerCase(); // Windows 文件名不区分大小写
+    count[key] = (count[key] || 0) + 1;
+    let suffix = count[key] === 1 ? '' : ' (' + count[key] + ')';
+    if (used.has((base + suffix).toLowerCase())) suffix = ' #' + d.id; // 极端情况：与真实标题 "xxx (2)" 撞名
+    used.add((base + suffix).toLowerCase());
+    d.name = d.title + suffix;
+    d.file = base + suffix;
+  }
+  return docs;
+}
+
+// 按序号或名称选文档：纯数字且在范围内 → 列表第 n 项；否则先精确匹配 name（可带 " (2)" 后缀），再匹配标题（同名取第一篇）
+function pickDoc(docs, input) {
+  const n = parseInt(input, 10);
+  if (/^\d+$/.test(input) && n >= 1 && n <= docs.length) return docs[n - 1];
+  const d = docs.find(x => x.name === input) || docs.find(x => x.title === input);
+  const same = d && d.title === input ? docs.filter(x => x.title === input) : [];
+  if (same.length > 1) {
+    console.log('  注: 共有 ' + same.length + ' 篇同名文档，本次截第一篇；其余可输入: ' + same.slice(1).map(x => '"' + x.name + '"').join(', '));
+  }
+  return d || null;
 }
 
 // ============================================================
 // 文档截图辅助
 // ============================================================
-async function clickDoc(page, projectName, docName) {
-  // 辅助：在当前页尝试点击文档链接
-  async function tryClick() {
-    const f = getFrame(page);
-    try { await f.locator('.cursor-pointer:has([title="' + docName + '"])').first().click({ timeout: W.CLICK }); return true; }
-    catch (e) {}
-    try { await f.locator('a:has-text("' + docName + '")').first().click({ timeout: W.CLICK_ALT }); return true; }
-    catch (e) {}
-    return false;
-  }
-
-  if (await tryClick()) {
-    await getFrame(page).locator('#main').waitFor({ state: 'visible', timeout: W.TIMEOUT });
-    return;
-  }
-
-  // 当前页没找到，翻页查找（最多 50 页）
-  for (let pg = 1; pg < 50; pg++) {
-    const hasNext = await getFrame(page).evaluate(() => {
-      const nav = document.querySelector('nav.pager, .pager');
-      if (!nav) return false;
-      const nextBtn = nav.querySelector('button.pager-link:not(.disabled) .icon-angle-right, button:not(.disabled) .icon-angle-right');
-      return !!(nextBtn && nextBtn.offsetParent !== null);
-    });
-    if (!hasNext) break;
-    if (!(await clickNextPage(page))) break;
+// 按文档 ID 直接打开 doc-view 页（同名文档也能准确区分，不依赖列表翻页和标题点击）
+async function openDoc(page, doc) {
+  await page.goto(CONFIG.baseUrl + '/doc-view-' + doc.id + '.html', { waitUntil: 'domcontentloaded', timeout: W.TIMEOUT });
+  const start = Date.now();
+  while (Date.now() - start < W.EDITOR_TO) {
+    const f = page.frame({ name: 'app-doc' });
+    if (f && (await f.locator('.doc-view').count().catch(() => 0)) > 0) return true;
     await page.waitForTimeout(500);
-    if (await tryClick()) {
-      await getFrame(page).locator('#main').waitFor({ state: 'visible', timeout: W.TIMEOUT });
-      return;
-    }
   }
-
-  // 仍没找到，重新导航后翻页再试
-  console.log('  回退: 重新导航...');
-  await ensureProjectSpace(page);
-  const t = getFrame(page);
-  await t.locator('text=' + projectName).first().click();
-  await page.waitForTimeout(W.TAB);
-
-  if (await tryClick()) {
-    await getFrame(page).locator('#main').waitFor({ state: 'visible', timeout: W.TIMEOUT });
-    return;
-  }
-  for (let pg = 1; pg < 50; pg++) {
-    const hasNext = await getFrame(page).evaluate(() => {
-      const nav = document.querySelector('nav.pager, .pager');
-      if (!nav) return false;
-      const nextBtn = nav.querySelector('button.pager-link:not(.disabled) .icon-angle-right, button:not(.disabled) .icon-angle-right');
-      return !!(nextBtn && nextBtn.offsetParent !== null);
-    });
-    if (!hasNext) break;
-    if (!(await clickNextPage(page))) break;
-    await page.waitForTimeout(500);
-    if (await tryClick()) {
-      await getFrame(page).locator('#main').waitFor({ state: 'visible', timeout: W.TIMEOUT });
-      return;
-    }
-  }
-
-  throw new Error('找不到文档: ' + docName);
+  return false;
 }
 async function waitForDocStable(page) {
   await page.waitForLoadState('networkidle', { timeout: W.NETIDLE }).catch(() => {});
@@ -297,6 +272,24 @@ async function waitForDocStable(page) {
   const f = getFrame(page);
   try { await f.locator('.editor.doc-editor-control, .doc-editor').first().waitFor({ state: 'attached', timeout: W.EDITOR_TO }); }
   catch (e) { console.log('  [warn] editor: ' + e.message.slice(0, 50)); return; }
+
+  // 等待异步编辑器加载完成（loading 指示器消失）
+  const loadStart = Date.now();
+  let loadingLogged = false;
+  while (Date.now() - loadStart < W.EDITOR_LOAD) {
+    const stillLoading = await f.evaluate(() => {
+      const loadEl = document.querySelector('.load-indicator.loading, [data-loading]');
+      if (!loadEl) return false;
+      const style = window.getComputedStyle(loadEl);
+      return style.display !== 'none' && style.visibility !== 'hidden' && loadEl.offsetParent !== null;
+    }).catch(() => true);
+    if (!stillLoading) break;
+    if (!loadingLogged) { console.log('  等待编辑器加载...'); loadingLogged = true; }
+    await page.waitForTimeout(1000);
+  }
+  // 编辑器加载后给渲染一点时间
+  await page.waitForTimeout(1000);
+
   let prev = -1, stable = 0;
   for (let i = 0; i < W.STABLE_MAX; i++) {
     await page.waitForTimeout(W.STABLE_POLL);
@@ -308,22 +301,6 @@ async function waitForDocStable(page) {
     else { stable = 0; }
     prev = len;
   }
-}
-async function verifyDocOpened(page, docName) {
-  const f = getFrame(page);
-  const t = await f.evaluate(() => document.body?.innerText || '');
-  if (!(t.includes('文档标题') && t.includes('由谁添加'))) return true;
-  console.log('  重试打开...');
-  try {
-    await f.locator('.cursor-pointer:has([title="' + docName + '"])').first().click({ timeout: W.FALLBACK });
-    await f.locator('#main').waitFor({ state: 'visible', timeout: W.TIMEOUT });
-    try { await f.locator('.editor.doc-editor-control, .doc-editor').first().waitFor({ state: 'attached', timeout: W.TIMEOUT }); } catch {}
-  } catch (e) { console.log('  [warn] retry: ' + e.message.slice(0, 50)); }
-  const t2 = await f.evaluate(() => document.body?.innerText || '');
-  if (t2.includes('文档标题') && t2.includes('由谁添加')) {
-    try { await f.locator('a:has-text("' + docName + '")').first().click({ timeout: W.FALLBACK }); await page.waitForTimeout(1000); } catch {}
-  }
-  return !(await f.evaluate(() => document.body?.innerText || '')).includes('由谁添加');
 }
 async function skipIfAttachment(page) {
   const f = getFrame(page);
@@ -359,64 +336,64 @@ async function skipIfAttachment(page) {
   return false;
 }
 
-// Affine 编辑器：缩 viewport → 逐块滚动触发懒渲染 → 展开 overflow → 返回 scrollHeight
-async function renderAffine(page) {
+// 等待编辑器内图片加载完成
+async function waitImages(f) {
+  await f.evaluate(async () => {
+    const imgs = [...document.querySelectorAll('.editor.doc-editor-control img, .doc-editor img')];
+    await Promise.all(imgs.map(img => img.complete ? null
+      : new Promise(r => { img.addEventListener('load', r); img.addEventListener('error', r); setTimeout(r, 10000); })));
+  }).catch(() => {});
+}
+
+// 放大 viewport 直到文档全文都在 iframe 内渲染（.doc-view-content 不再需要滚动）
+// 注意：文档滚动发生在 .doc-view-content 内部，window 本身不滚动，所以不能靠 window.scrollTo 分段截图
+async function fitViewportToContent(page) {
+  const f = getFrame(page);
+  for (let i = 0; i < 6; i++) {
+    await waitImages(f);
+    const overflow = await f.evaluate(() => {
+      const c = document.querySelector('.doc-view-content');
+      if (c) return c.scrollHeight - c.clientHeight;
+      return document.documentElement.scrollHeight - window.innerHeight;
+    });
+    if (overflow <= 2) return;
+    const cur = page.viewportSize();
+    const h = Math.min(MAX_VP_H, cur.height + overflow + 200);
+    if (h <= cur.height) { console.log('  [warn] 文档超长，超出最大 viewport ' + MAX_VP_H + 'px，底部可能被截断'); return; }
+    await page.setViewportSize({ width: cur.width, height: h });
+    await page.waitForTimeout(W.VP_SETTLE);
+  }
+}
+
+// 左右加白边
+function addHPadding(png) {
+  const w = png.width + PAD_H * 2;
+  const padded = new PNG({ width: w, height: png.height });
+  padded.data.fill(255);
+  for (let row = 0; row < png.height; row++) {
+    png.data.copy(padded.data, (row * w + PAD_H) * 4, row * png.width * 4, (row + 1) * png.width * 4);
+  }
+  return padded;
+}
+
+// Affine 编辑器：viewport 放大到容纳全文 → 一次截取编辑器元素 → 裁底部空白 → 加白边
+async function renderAndCaptureAffine(page, out) {
   const f = getFrame(page);
   const vp = page.viewportSize();
-  await page.setViewportSize({ width: vp.width, height: 400 });
-  await page.waitForTimeout(W.VP_RESIZE);
 
-  const preH = await f.evaluate(sel => {
-    const el = document.querySelector(sel); return el ? el.scrollHeight : 0;
-  }, SCROLL_CONTAINER);
+  await fitViewportToContent(page);
+  const buf = await f.locator(CONTENT_EL_AFFINE).screenshot({ timeout: W.EDITOR_TO });
+  const png = PNG.sync.read(buf);
+  const finalH = trimBottom(buf, PAD_BOTTOM);
+  const dst = new PNG({ width: png.width, height: Math.max(50, finalH) });
+  png.data.copy(dst.data, 0, 0, dst.height * png.width * 4);
+  const padded = addHPadding(dst);
+  fs.writeFileSync(out, PNG.sync.write(padded));
+  console.log('  截图: ' + padded.width + 'x' + padded.height + ' (viewport 高 ' + page.viewportSize().height + ')');
 
-  // 滚动触发懒渲染，追踪最大 scrollHeight
-  const maxFromScroll = await f.evaluate(async ({init, stepMs, sel}) => {
-    const c = document.querySelector(sel); if (!c) return 0;
-    await new Promise(r => setTimeout(r, init));
-    let total = c.scrollHeight, maxH = total;
-    const s = Math.max(c.clientHeight, 300);
-    for (let y = 0; y < total; y += s) {
-      c.scrollTo(0, y);
-      await new Promise(r => setTimeout(r, stepMs));
-      total = c.scrollHeight; if (total > maxH) maxH = total;
-    }
-    return maxH;
-  }, {init: W.SCROLL_INITIAL, stepMs: W.SCROLL_STEP, sel: SCROLL_CONTAINER});
-
-  // 滚回顶部
-  await f.evaluate(sel => { const c = document.querySelector(sel); if (c) c.scrollTo(0, 0); }, SCROLL_CONTAINER);
-  await page.waitForTimeout(W.SCROLL_FINAL);
-
-  // 恢复大 viewport 后测量（关键：3600px 下 Affine 渲染更多内容，scrollHeight 才准确）
+  // 恢复 viewport
   await page.setViewportSize(vp);
-  await page.waitForTimeout(W.OVERFLOW_SETTLE);
-
-  const cur = await f.evaluate((contentSel) => {
-    const el = document.querySelector(contentSel);
-    return el ? Math.max(el.scrollHeight, document.body.scrollHeight, document.documentElement.scrollHeight) : 0;
-  }, CONTENT_EL_AFFINE);
-  const captured = Math.max(cur, preH, maxFromScroll);
-
-  // 展开 overflow
-  await f.evaluate(sel => {
-    for (const el of document.querySelectorAll(sel)) {
-      el.style.setProperty('overflow', 'visible', 'important');
-      el.style.setProperty('overflow-y', 'visible', 'important');
-      el.style.setProperty('max-height', 'none', 'important');
-      el.style.setProperty('height', 'auto', 'important');
-    }
-  }, EXPAND_ALL);
-
-  // 等图片 + 网络空闲
-  await f.evaluate(async () => {
-    const imgs = document.querySelectorAll('img');
-    await Promise.all([...imgs].map(img => img.complete ? Promise.resolve() : new Promise(r => { img.onload = img.onerror = r; })));
-  }).catch(() => {});
-  await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
-  await page.waitForTimeout(W.POST_EXPAND);
-
-  return captured;
+  return out;
 }
 
 // 旧版编辑器：展开 overflow
@@ -439,103 +416,112 @@ async function expandOldEditor(page) {
 }
 
 // 截图 + 裁切
-async function captureAndCrop(page, contentHeight, projectDir, docName, isAffine) {
+async function captureAndCrop(page, contentHeight, out, isAffine) {
   const f = getFrame(page);
-  const safe = docName.replace(/[\/:*?"<>|]/g, '_').slice(0, 50);
-  const out = path.join(projectDir, safe + '.png');
-  const contentSel = isAffine ? CONTENT_EL_AFFINE : CONTENT_EL_OLD;
 
-  // 定位：iframe 在主页面中有偏移，需要加 iframe 坐标才能正确裁剪
-  const iframeBox = await page.evaluate(() => {
-    const ifr = document.querySelector('iframe[name="app-doc"]');
-    if (!ifr) return { x: 0, y: 0 };
-    const r = ifr.getBoundingClientRect();
-    return { x: r.x, y: r.y };
-  });
+  // 直接从 iframe 内截图（避免主页面截取 iframe 时的渲染不完整问题）
+  // 目标：截取 .doc-view 内容区域（含编辑器正文）
+  const targetEl = isAffine ? '.doc-view' : '.doc-view';
+  const elInfo = await f.evaluate((sel) => {
+    const el = document.querySelector(sel);
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return { x: r.x, y: r.y, w: r.width, h: r.height };
+  }, targetEl);
 
-  // 宽度用 .doc-view（跳过左侧大纲面板，也不裁右边内容）
-  // 顶部用编辑器 body（跳过标题栏+编辑人）
-  const info = await f.evaluate(({cachedH, bodySel}) => {
-    const view = document.querySelector('.doc-view');
-    const body = document.querySelector(bodySel);
-    if (!view || !body) return null;
-    const v = view.getBoundingClientRect();
-    const b = body.getBoundingClientRect();
-    const domH = Math.max(body.scrollHeight, document.body.scrollHeight, document.documentElement.scrollHeight, b.height);
-    return { x: v.x, y: b.y, w: v.width, h: Math.max(cachedH || 0, domH) };
-  }, {cachedH: contentHeight, bodySel: contentSel});
-
-  if (!info || info.h <= 100) { await page.screenshot({ path: out, fullPage: true }); return out; }
-
-  // 绝对坐标 = iframe 偏移 + iframe 内元素坐标
-  const absX = iframeBox.x + info.x;
-  const absY = iframeBox.y + info.y;
-
-  const targetH = Math.max(contentHeight, 15000);
-  console.log('  内容区 absX=' + absX + ' absY=' + absY + ' w=' + info.w + ' contentH=' + contentHeight + ' targetH=' + targetH);
-
-  // 展开主页面 + iframe
-  await page.evaluate(h => {
-    document.documentElement.style.setProperty('height', 'auto', 'important');
-    document.documentElement.style.setProperty('overflow', 'visible', 'important');
-    document.body.style.setProperty('height', 'auto', 'important');
-    document.body.style.setProperty('overflow', 'visible', 'important');
-    const ifr = document.querySelector('iframe[name="app-doc"]');
-    if (ifr) { ifr.style.setProperty('height', h + 'px', 'important'); ifr.style.setProperty('max-height', 'none', 'important'); }
-  }, targetH);
-  await page.waitForTimeout(W.OVERFLOW_OLD);
-
-  const origVp = page.viewportSize();
-  await page.setViewportSize({ width: origVp.width, height: targetH + 200 });
-  await page.waitForTimeout(W.VP_SETTLE);
-
-  const rawBuf = await page.screenshot();
-  const fullPng = PNG.sync.read(rawBuf);
-
-  const cx = Math.max(0, Math.floor(absX) - PAD_X);
-  const cy = Math.max(0, Math.floor(absY));
-  const cw = Math.min(Math.floor(info.w) + PAD_X * 2, fullPng.width - cx);
-  const tmpH = Math.min(contentHeight + PAD_BOTTOM, fullPng.height - cy);
-
-  const tmp = new PNG({ width: cw, height: Math.max(50, tmpH) });
-  for (let row = 0; row < tmp.height; row++) {
-    const srcOff = ((cy + row) * fullPng.width + cx) * 4;
-    fullPng.data.copy(tmp.data, row * tmp.width * 4, srcOff, srcOff + tmp.width * 4);
+  if (!elInfo || elInfo.h <= 100) {
+    // 回退：全页截图
+    await f.locator(targetEl).screenshot({ path: out });
+    return out;
   }
 
-  // 像素分析精确裁剪底部空白
-  const finalH = trimBottom(PNG.sync.write(tmp), PAD_BOTTOM);
-  const dst = new PNG({ width: tmp.width, height: Math.max(50, finalH) });
-  tmp.data.copy(dst.data, 0, 0, dst.height * tmp.width * 4);
-  fs.writeFileSync(out, PNG.sync.write(dst));
+  // 确保 iframe 内 overflow 展开
+  await f.evaluate(() => {
+    const sel = '.doc-view, .doc-view-content, .doc-main, .doc-editor, .editor.doc-editor-control, #mainContent';
+    for (const el of document.querySelectorAll(sel)) {
+      el.style.setProperty('overflow', 'visible', 'important');
+      el.style.setProperty('overflow-y', 'visible', 'important');
+      el.style.setProperty('max-height', 'none', 'important');
+      el.style.setProperty('height', 'auto', 'important');
+    }
+    document.documentElement.style.setProperty('overflow', 'visible', 'important');
+    document.body.style.setProperty('overflow', 'visible', 'important');
+  });
+  await page.waitForTimeout(500);
 
-  await page.setViewportSize(origVp);
+  // 从 iframe 内直接截图 .doc-view
+  const rawBuf = await f.locator(targetEl).screenshot();
+  const rawPng = PNG.sync.read(rawBuf);
+  console.log('  iframe截图: ' + rawPng.width + 'x' + rawPng.height + ' (contentH=' + contentHeight + ')');
+
+  // trimBottom 裁剪底部空白
+  const finalH = trimBottom(rawBuf, PAD_BOTTOM);
+  const dst = new PNG({ width: rawPng.width, height: Math.max(50, finalH) });
+  rawPng.data.copy(dst.data, 0, 0, dst.height * rawPng.width * 4);
+  fs.writeFileSync(out, PNG.sync.write(dst));
+  console.log('  裁切后: ' + dst.width + 'x' + dst.height);
+
   return out;
 }
 
 // ============================================================
 // 主流程
 // ============================================================
-async function screenshotDoc(page, projectName, docName) {
+// doc: getDocsForProject 返回的 { id, title, name, file }
+async function screenshotDoc(page, projectName, doc) {
   const projectDir = path.join(CONFIG.outputBase, projectName);
   if (!fs.existsSync(projectDir)) fs.mkdirSync(projectDir, { recursive: true });
+  const out = path.join(projectDir, doc.file + '.png');
 
-  console.log('  [1/6] 打开文档...'); await clickDoc(page, projectName, docName);
-  console.log('  [2/6] 等待加载...'); await waitForDocStable(page);
-  console.log('  [3/6] 验证...'); if (!await verifyDocOpened(page, docName)) { console.log('  无法打开文档'); return null; }
-  console.log('  [4/6] 检测类型...'); if (await skipIfAttachment(page)) return null;
+  console.log('  [1/5] 打开文档 #' + doc.id + '...');
+  if (!await openDoc(page, doc)) throw new Error('无法打开文档 #' + doc.id);
+  // 鼠标移出正文区域：鼠标停在图片上时会浮出「下载 / ⋮」工具栏，被一起截进去
+  await page.mouse.move(0, 0);
+  console.log('  [2/5] 等待加载...'); await waitForDocStable(page);
+  console.log('  [3/5] 检测内容...');
 
+  // 检测文档正文是否为空（仅元数据无正文内容）
   const f = getFrame(page);
+  const bodyInfo = await f.evaluate(() => {
+    const ed = document.querySelector('.editor.doc-editor-control') || document.querySelector('.doc-editor');
+    if (!ed) return { len: 0, hasContent: false };
+    // 找到并排除文档标题（第一个 h1，属于元数据而非正文）
+    const h1s = ed.querySelectorAll('h1');
+    const titleEl = h1s.length > 0 ? h1s[0] : null;
+    const titleText = titleEl ? (titleEl.innerText?.trim() || '') : '';
+    // 检查标题之后是否有实质性内容元素（段落、表格、图片等）
+    const contentEls = ed.querySelectorAll('p, h2, h3, h4, h5, h6, table, ul, ol, pre, blockquote, img, [class*="paragraph"], [class*="content-block"], [class*="editor-block"]');
+    for (const el of contentEls) {
+      if (el === titleEl) continue;
+      const txt = el.innerText?.trim() || '';
+      if (txt.length > 5) return { len: ed.innerText?.length || 0, hasContent: true };
+      if (el.tagName === 'IMG' || el.querySelector('img')) return { len: ed.innerText?.length || 0, hasContent: true };
+    }
+    // 无实质性正文 → 排除标题后检查剩余文本长度
+    const totalLen = ed.innerText?.length || 0;
+    const bodyLen = Math.max(0, totalLen - titleText.length);
+    return { len: totalLen, hasContent: bodyLen > 80 };
+  });
+  if (!bodyInfo.hasContent) {
+    console.log('  ⚠ 警告: 文档正文为空（仅有元数据），截图将只含标题信息');
+  }
+
+  if (await skipIfAttachment(page)) return null;
+
   const isAffine = (await f.locator('.editor.doc-editor-control').count()) > 0;
-  const isOld = (await f.locator('.doc-editor, .doc-view').count()) > 0;
+  const isOld = !isAffine && (await f.locator('.doc-editor, .doc-view').count()) > 0;
+
+  if (isAffine) {
+    console.log('  [4/5] Affine 编辑器截图...');
+    return await renderAndCaptureAffine(page, out);
+  }
 
   let contentHeight = 0;
-  if (isAffine) { console.log('  [5/6] Affine 编辑器渲染...'); contentHeight = await renderAffine(page); }
-  else if (isOld) { console.log('  [5/6] 旧版编辑器展开...'); contentHeight = await expandOldEditor(page); }
-  else { console.log('  [5/6] 通用截图...'); }
+  if (isOld) { console.log('  [4/5] 旧版编辑器展开...'); contentHeight = await expandOldEditor(page); }
+  else { console.log('  [4/5] 通用截图...'); }
 
-  console.log('  [6/6] 截图 + 裁切...');
-  return await captureAndCrop(page, contentHeight, projectDir, docName, isAffine);
+  console.log('  [5/5] 截图 + 裁切...');
+  return await captureAndCrop(page, contentHeight, out, isAffine);
 }
 
 // ============================================================
@@ -560,7 +546,7 @@ async function screenshotDoc(page, projectName, docName) {
 
   console.log('登录...'); await ensureLogin(page);
 
-  let projectName = args[0], docName = args[1];
+  let projectName = args[0];
 
   if (!projectName) {
     console.log('获取项目列表...');
@@ -574,30 +560,40 @@ async function screenshotDoc(page, projectName, docName) {
   }
   console.log('→ 项目: ' + projectName);
 
-  if (!docName) {
-    console.log('获取文档列表...');
-    const docs = await getDocsForProject(page, projectName);
-    if (docs.length === 0) { console.log('未找到文档'); await browser.close(); process.exit(1); }
+  console.log('获取文档列表...');
+  const docs = await getDocsForProject(page, projectName);
+  if (docs.length === 0) { console.log('未找到文档'); await browser.close(); process.exit(1); }
+
+  // 要截的文档：命令行直接指定（可多个），或交互选择（序号 / 名称，多选逗号分隔）
+  let inputs = args.length > 1 ? args.slice(1) : null;
+  if (!inputs) {
     console.log('\n========== ' + projectName + ' (' + docs.length + '个文档) ==========');
-    docs.forEach((d, i) => console.log('  [' + (i + 1) + '] ' + d));
+    docs.forEach((d, i) => console.log('  [' + (i + 1) + '] ' + d.name));
     console.log('========================================');
     const ans = await ask('\n选择序号(多选逗号分隔)或输入文档名: ');
-    const parts = ans.split(',').map(s => s.trim()).filter(Boolean);
-    if (parts.length > 1) {
-      for (const p of parts) {
-        const n = parseInt(p); docName = (!isNaN(n) && n >= 1 && n <= docs.length) ? docs[n - 1] : p;
-        console.log('\n→ 截图: ' + docName + '...');
-        const o = await screenshotDoc(page, projectName, docName);
-        if (o) console.log('  完成: ' + o);
-      }
-      await browser.close(); return;
-    } else {
-      const n = parseInt(ans); docName = (!isNaN(n) && n >= 1 && n <= docs.length) ? docs[n - 1] : ans;
+    inputs = ans.split(',').map(s => s.trim()).filter(Boolean);
+    if (inputs.length === 0) console.log('未选择文档');
+  }
+  const targets = inputs.map(input => ({ input, doc: pickDoc(docs, input) }));
+
+  // 逐篇截图：单篇失败不影响其余
+  const done = [], skipped = [], failed = [];
+  for (const { input, doc } of targets) {
+    if (!doc) { console.log('\n找不到文档: ' + input); failed.push(input); continue; }
+    console.log('\n→ 截图: ' + doc.name + '...');
+    try {
+      const o = await screenshotDoc(page, projectName, doc);
+      if (o) { done.push(doc.name); console.log('  完成: ' + o); }
+      else skipped.push(doc.name);
+    } catch (e) {
+      failed.push(doc.name);
+      console.log('  失败: ' + e.message.split('\n')[0]);
     }
   }
-
-  console.log('→ 截图: ' + docName + '...');
-  const o = await screenshotDoc(page, projectName, docName);
-  if (o) console.log('完成: ' + o);
+  if (targets.length > 1) {
+    console.log('\n========== 汇总：完成 ' + done.length + '，跳过 ' + skipped.length + '，失败 ' + failed.length + ' ==========');
+    skipped.forEach(n => console.log('  跳过: ' + n));
+    failed.forEach(n => console.log('  失败: ' + n));
+  }
   await browser.close();
 })().catch(e => { console.error('致命错误:', e.message); process.exit(1); });
