@@ -1,6 +1,6 @@
 # 禅道文档截图
 
-自动登录禅道系统，截取项目空间文档内容为 PNG 图片。
+登录禅道系统（每人用自己的账号），截取项目空间文档内容为 PNG 图片。
 
 ## 安装
 
@@ -11,19 +11,37 @@ npm install
 > **注意**：不要用 `npx playwright install chromium`，该命令还会下载 chromium-headless-shell（额外 112MB）。
 > 请手动下载 [Chrome for Testing](https://googlechromelabs.github.io/chrome-for-testing/) 并放到 `~/AppData/Local/ms-playwright/chromium-1223/chrome-win64/`，脚本会自动检测该路径。
 
-## 配置
+## 登录（每人用自己的禅道账号）
 
-创建 `config.json`（已在 .gitignore 中，不会提交）：
+两种方式任选一种：
+
+1. **弹窗登录（不保存密码）**：直接运行，或先执行 `node zentao-shot.js --login`。脚本会弹出浏览器窗口，用自己的账号登录即可，登录成功后窗口自动关闭。之后会复用登录会话；会话过期时会再次弹窗。
+2. **config.json 写自己的账号密码（自动登录）**：见下方「配置」。如果密码失效（比如改过密码），脚本会自动改用弹窗登录，弹窗里会预先填好用户名。
+
+```bash
+node zentao-shot.js --login    # 登录 / 切换账号（只登录，不截图）
+node zentao-shot.js --logout   # 退出：删除本机保存的登录会话
+```
+
+登录会话保存在 `%USERPROFILE%\.zentao-screenshots\session.json`，每个 Windows 用户一份，只存在本机。**不要把它发给别人**，它等同于你的登录状态。
+
+## 配置（可选）
+
+不创建 config.json 也能用：地址用默认值，登录用弹窗。需要时创建 `config.json`，推荐放在
+`%USERPROFILE%\.zentao-screenshots\config.json`，这样工具文件夹里不含任何个人信息，可以直接拷给别人。
+放在工具目录下的旧位置也兼容（已在 .gitignore 中，不会提交）。两处都有时，以个人目录的为准。
 
 ```json
 {
   "baseUrl": "http://your-zentao-host/zentao",
-  "username": "your_username",
-  "password": "your_password",
+  "username": "自己的账号（可选）",
+  "password": "自己的密码（可选；不填则弹窗登录）",
   "outputPath": "./",
   "viewport": { "width": 1920, "height": 3600 }
 }
 ```
+
+环境变量（可选）：`ZENTAO_HOME` 可以改个人目录的位置；`ZENTAO_LOGIN_TIMEOUT` 设置弹窗等待登录的秒数，默认 300。
 
 ## 使用
 
@@ -56,7 +74,7 @@ node batch-shot.js "项目名" "文档1" "文档2" "文档3"
 
 ## 特性
 
-- 自动登录（首次需密码，后续复用 session）
+- 每人用自己的账号：弹窗登录（不保存密码）或 config.json 自动登录；会话存放在个人目录，过期前一直复用
 - 仅截取项目空间文档；文档列表取自项目的「全部文档」视图（已含各阶段库，不含附件库里的文件）
 - 按文档 ID 打开文档，同名文档也能区分
 - 多选截图时单篇失败不影响其余，结束后输出汇总

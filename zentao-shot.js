@@ -5,6 +5,7 @@
 const { chromium } = require('playwright');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const readline = require('readline');
 const { PNG } = require('pngjs');
 
@@ -12,17 +13,22 @@ const { PNG } = require('pngjs');
 // 配置
 // ============================================================
 const SCRIPT_DIR = __dirname;
-const configPath = path.join(SCRIPT_DIR, 'config.json');
-if (!fs.existsSync(configPath)) { console.error('错误: 找不到 config.json'); process.exit(1); }
-const userConfig = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+// 每个人自己的登录会话和配置放在自己的用户目录（不在工具文件夹里，工具文件夹可以放心拷给别人）
+const USER_DIR = process.env.ZENTAO_HOME || path.join(os.homedir(), '.zentao-screenshots');
+const LEGACY_STATE = path.join(SCRIPT_DIR, '.zentao-session.json');   // 旧版会话位置，首次运行时自动搬走
+// 配置可选：先找用户目录的 config.json，再找工具目录的（兼容旧用法）；都没有就用默认值
+const configPath = [path.join(USER_DIR, 'config.json'), path.join(SCRIPT_DIR, 'config.json')].find(p => fs.existsSync(p));
+const userConfig = configPath ? JSON.parse(fs.readFileSync(configPath, 'utf-8')) : {};
 const CONFIG = {
   baseUrl: userConfig.baseUrl || 'http://192.168.10.227:90/zentao',
-  username: userConfig.username || '',
+  username: userConfig.username || '',   // 可不填：不填时弹出浏览器窗口由本人登录，脚本不保存密码
   password: userConfig.password || '',
-  stateFile: path.join(SCRIPT_DIR, '.zentao-session.json'),
+  stateFile: path.join(USER_DIR, 'session.json'),
   outputBase: userConfig.outputPath || SCRIPT_DIR,
   viewport: userConfig.viewport || { width: 1920, height: 3600 },
 };
+const LOGIN_WAIT_MS = (parseInt(process.env.ZENTAO_LOGIN_TIMEOUT, 10) || 300) * 1000;  // 等人登录，默认 5 分钟
+const CHROME_PATH = path.join(os.homedir(), 'AppData', 'Local', 'ms-playwright', 'chromium-1223', 'chrome-win64', 'chrome.exe');
 
 // ============================================================
 // 等待 / 超时
@@ -102,17 +108,81 @@ function trimBottom(pngBuf, padBottom) {
 // ============================================================
 // 登录 & 导航
 // ============================================================
-async function ensureLogin(page) {
-  await page.goto(CONFIG.baseUrl + '/my.html', { waitUntil: 'domcontentloaded', timeout: W.TIMEOUT });
-  if (page.url().includes('user-login')) {
-    await page.locator('input[name="account"]').fill(CONFIG.username);
-    await page.locator('input[name="password"]').fill(CONFIG.password);
-    await Promise.all([
-      page.waitForURL(/\/my/, { timeout: W.TIMEOUT }),
-      page.locator('#submit, button[type="submit"], input[type="submit"], .btn-primary').first().click(),
-    ]);
-    fs.writeFileSync(CONFIG.stateFile, JSON.stringify(await page.context().storageState()));
+function saveSession(state) {
+  fs.mkdirSync(USER_DIR, { recursive: true });
+  fs.writeFileSync(CONFIG.stateFile, JSON.stringify(state));
+}
+
+function loadSession() {
+  if (fs.existsSync(CONFIG.stateFile)) return JSON.parse(fs.readFileSync(CONFIG.stateFile, 'utf-8'));
+  if (fs.existsSync(LEGACY_STATE)) {             // 旧版把会话存在工具目录里：搬到用户目录
+    const state = JSON.parse(fs.readFileSync(LEGACY_STATE, 'utf-8'));
+    saveSession(state);
+    fs.unlinkSync(LEGACY_STATE);
+    console.log('（登录会话已从工具目录搬到 ' + CONFIG.stateFile + '）');
+    return state;
   }
+  return undefined;
+}
+
+// 弹出浏览器窗口，由本人用自己的禅道账号登录；返回登录后的会话（cookie），不经手密码
+async function interactiveLogin() {
+  console.log('\n需要登录禅道：已弹出浏览器窗口，请用【你自己的禅道账号】登录。');
+  console.log('登录成功后窗口会自动关闭（最多等 ' + LOGIN_WAIT_MS / 1000 + ' 秒）。账号密码只在浏览器里输入，脚本不会保存密码。\n');
+  const b = await chromium.launch({ headless: false, executablePath: fs.existsSync(CHROME_PATH) ? CHROME_PATH : undefined });
+  try {
+    const c = await b.newContext({ viewport: { width: 1280, height: 860 } });
+    const p = await c.newPage();
+    await p.goto(CONFIG.baseUrl + '/user-login.html', { waitUntil: 'domcontentloaded', timeout: W.TIMEOUT });
+    if (CONFIG.username) await p.locator('input[name="account"]').fill(CONFIG.username).catch(() => {});  // 只预填用户名
+    const closed = new Promise((_, reject) => {
+      const fail = () => reject(new Error('登录窗口被关闭，未完成登录'));
+      p.on('close', fail);
+      b.on('disconnected', fail);
+    });
+    await Promise.race([
+      p.waitForURL(u => !u.href.includes('user-login'), { timeout: LOGIN_WAIT_MS, waitUntil: 'commit' }),
+      closed,
+    ]).catch(e => {
+      throw new Error(e.name === 'TimeoutError' ? '等待登录超时（' + LOGIN_WAIT_MS / 1000 + ' 秒）' : e.message);
+    });
+    await p.waitForLoadState('domcontentloaded').catch(() => {});
+    return await c.storageState();
+  } finally {
+    await b.close().catch(() => {});
+  }
+}
+
+async function ensureLogin(page, forceLogin = false) {
+  if (!forceLogin) {
+    await page.goto(CONFIG.baseUrl + '/my.html', { waitUntil: 'domcontentloaded', timeout: W.TIMEOUT });
+    if (!page.url().includes('user-login')) return;              // 会话有效
+  }
+  if (CONFIG.username && CONFIG.password && !forceLogin) {         // config.json 里写了自己的账号密码：自动登录
+    try {
+      await page.locator('input[name="account"]').fill(CONFIG.username);
+      await page.locator('input[name="password"]').fill(CONFIG.password);
+      await Promise.all([
+        page.waitForURL(/\/my/, { timeout: W.TIMEOUT, waitUntil: 'domcontentloaded' }),  // 首页加载慢，不等 load
+        page.locator('#submit, button[type="submit"], input[type="submit"], .btn-primary').first().click(),
+      ]);
+    } catch (e) {
+      if (page.url().includes('user-login')) {
+        console.log('config.json 里的账号密码没能登录（密码可能已修改）→ 改用弹窗登录。登录后记得更新 config.json。');
+      }
+    }
+    if (!page.url().includes('user-login')) {
+      saveSession(await page.context().storageState());
+      return;
+    }
+  }
+  const state = await interactiveLogin();
+  await page.context().clearCookies();
+  await page.context().addCookies(state.cookies);
+  saveSession(state);
+  await page.goto(CONFIG.baseUrl + '/my.html', { waitUntil: 'domcontentloaded', timeout: W.TIMEOUT });
+  if (page.url().includes('user-login')) throw new Error('登录后仍停在登录页，请重新运行：node zentao-shot.js --login');
+  console.log('登录成功，会话已保存到 ' + CONFIG.stateFile + '（只在本机，不要发给别人）');
 }
 async function ensureProjectSpace(page) {
   if (!page.url().includes('doc-projectSpace')) {
@@ -528,23 +598,24 @@ async function screenshotDoc(page, projectName, doc) {
 // 入口
 // ============================================================
 (async () => {
-  const args = process.argv.slice(2);
-  const chromePath = path.join(
-    process.env.USERPROFILE || process.env.HOME,
-    'AppData', 'Local', 'ms-playwright', 'chromium-1223', 'chrome-win64', 'chrome.exe'
-  );
+  const argv = process.argv.slice(2);
+  const flags = new Set(argv.filter(a => a.startsWith('--')));
+  const args = argv.filter(a => !a.startsWith('--'));
+  if (flags.has('--logout')) {
+    for (const f of [CONFIG.stateFile, LEGACY_STATE]) if (fs.existsSync(f)) fs.unlinkSync(f);
+    console.log('已退出：删除了本机保存的禅道登录会话。下次运行会弹出窗口重新登录。');
+    return;
+  }
   const browser = await chromium.launch({
     headless: true,
-    executablePath: fs.existsSync(chromePath) ? chromePath : undefined,
+    executablePath: fs.existsSync(CHROME_PATH) ? CHROME_PATH : undefined,
     args: ['--disable-gpu', '--disable-dev-shm-usage', '--no-sandbox', '--disable-extensions', '--disable-background-networking'],
   });
-  const ctx = await browser.newContext({
-    viewport: CONFIG.viewport,
-    storageState: fs.existsSync(CONFIG.stateFile) ? JSON.parse(fs.readFileSync(CONFIG.stateFile, 'utf-8')) : undefined,
-  });
+  const ctx = await browser.newContext({ viewport: CONFIG.viewport, storageState: loadSession() });
   const page = await ctx.newPage();
 
-  console.log('登录...'); await ensureLogin(page);
+  console.log('登录...'); await ensureLogin(page, flags.has('--login'));
+  if (flags.has('--login') && args.length === 0) { await browser.close(); return; }   // 只登录（首次设置 / 切换账号）
 
   let projectName = args[0];
 
