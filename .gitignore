@@ -6,3 +6,6 @@ debug-*
 final-*
 verify-*
 config.json
+# 项目输出目录（截图和客户资料）、压缩包
+/*/
+*.zip
